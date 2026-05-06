@@ -68,6 +68,29 @@ ros2 run aruco_nano_pose_estimator_cpp aruco_nano_pose_estimator --ros-args \
   -p save_debug_images:=false
 ```
 
+
+```bash
+ros2 run aruco_nano_pose_estimator_cpp aruco_nano_pose_estimator --ros-args \
+  -p marker_length:=1.0 \
+  -p dictionary_name:=DICT_4X4_50 \
+  -p drone_frame_id:=drone_base \
+  -p save_debug_images:=true \
+  -p debug_output_dir:=/mnt/nova_ssd/said_stuff/aruco_debug/aruco_nano_debug_pre \
+  -p debug_max_save_rate_hz:=24.0 \
+  -p preprocess_enable:=true \
+  -p preprocess_try_original_first:=true \
+  -p preprocess_use_gamma:=true \
+  -p preprocess_gamma:=1.35 \
+  -p preprocess_use_clahe:=true \
+  -p preprocess_clahe_clip_limit:=2.5 \
+  -p preprocess_clahe_tile_grid_size:=8 \
+  -p preprocess_use_median_blur:=false \
+  -p preprocess_use_adaptive_threshold:=true \
+  -p preprocess_adaptive_block_size:=31 \
+  -p preprocess_adaptive_c:=5.0 \
+  -p preprocess_use_otsu_threshold:=true \
+  -p use_track_filter:=false
+```
 ## Published Topics
 
 - `/aruco/pose`  
