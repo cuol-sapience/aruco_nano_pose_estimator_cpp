@@ -16,6 +16,7 @@
 
 #include "aruco_nano_pose_estimator_cpp/aruco_nano.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -61,11 +62,39 @@ public:
     use_iterative_pnp_ = this->declare_parameter<bool>("use_iterative_pnp", true);
     max_reprojection_error_px_ = this->declare_parameter<double>("max_reprojection_error_px", 4.0);
 
-    // Legacy parameter name preserved for launch-file compatibility.
-    // It is now interpreted as a static-landmark world-position random-walk sigma rate [m/sqrt(s)].
+    // Static-landmark world-position random-walk sigma rate [m/sqrt(s)].
     kf_process_accel_sigma_ = this->declare_parameter<double>("kf_process_accel_sigma", 0.05);
     kf_measurement_noise_floor_m_ = this->declare_parameter<double>("kf_measurement_noise_floor_m", 0.03);
     kf_speed_noise_scale_ = this->declare_parameter<double>("kf_speed_noise_scale", 0.3);
+
+    // Detection preprocessing
+    preprocess_enable_ = this->declare_parameter<bool>("preprocess_enable", false);
+    preprocess_try_original_first_ =
+      this->declare_parameter<bool>("preprocess_try_original_first", true);
+
+    preprocess_use_gamma_ = this->declare_parameter<bool>("preprocess_use_gamma", false);
+    preprocess_gamma_ = this->declare_parameter<double>("preprocess_gamma", 1.35);
+
+    preprocess_use_clahe_ = this->declare_parameter<bool>("preprocess_use_clahe", true);
+    preprocess_clahe_clip_limit_ =
+      this->declare_parameter<double>("preprocess_clahe_clip_limit", 2.5);
+    preprocess_clahe_tile_grid_size_ =
+      this->declare_parameter<int>("preprocess_clahe_tile_grid_size", 8);
+
+    preprocess_use_median_blur_ =
+      this->declare_parameter<bool>("preprocess_use_median_blur", false);
+    preprocess_median_blur_ksize_ =
+      this->declare_parameter<int>("preprocess_median_blur_ksize", 5);
+
+    preprocess_use_adaptive_threshold_ =
+      this->declare_parameter<bool>("preprocess_use_adaptive_threshold", true);
+    preprocess_adaptive_block_size_ =
+      this->declare_parameter<int>("preprocess_adaptive_block_size", 31);
+    preprocess_adaptive_c_ =
+      this->declare_parameter<double>("preprocess_adaptive_c", 5.0);
+
+    preprocess_use_otsu_threshold_ =
+      this->declare_parameter<bool>("preprocess_use_otsu_threshold", false);
 
     if (marker_length_ <= 0.0) {
       throw std::runtime_error("marker_length must be > 0");
@@ -92,6 +121,22 @@ public:
       throw std::runtime_error("kf_process_accel_sigma and kf_measurement_noise_floor_m must be > 0");
     }
 
+    if (preprocess_gamma_ <= 0.0) {
+      throw std::runtime_error("preprocess_gamma must be > 0");
+    }
+    if (preprocess_clahe_clip_limit_ <= 0.0) {
+      throw std::runtime_error("preprocess_clahe_clip_limit must be > 0");
+    }
+    if (preprocess_clahe_tile_grid_size_ <= 0) {
+      throw std::runtime_error("preprocess_clahe_tile_grid_size must be > 0");
+    }
+    if (preprocess_median_blur_ksize_ <= 0 || (preprocess_median_blur_ksize_ % 2) == 0) {
+      throw std::runtime_error("preprocess_median_blur_ksize must be a positive odd integer");
+    }
+    if (preprocess_adaptive_block_size_ <= 1 || (preprocess_adaptive_block_size_ % 2) == 0) {
+      throw std::runtime_error("preprocess_adaptive_block_size must be an odd integer > 1");
+    }
+
     if (save_debug_images_) {
       try {
         std::filesystem::create_directories(debug_output_dir_);
@@ -100,6 +145,16 @@ public:
           std::string("Failed to create debug_output_dir '") +
           debug_output_dir_ + "': " + e.what());
       }
+    }
+
+    if (preprocess_use_clahe_) {
+      clahe_ = cv::createCLAHE(
+        preprocess_clahe_clip_limit_,
+        cv::Size(preprocess_clahe_tile_grid_size_, preprocess_clahe_tile_grid_size_));
+    }
+
+    if (preprocess_use_gamma_) {
+      gamma_lut_ = makeGammaLut(preprocess_gamma_);
     }
 
     marker_labels_[1] = "Medical";
@@ -121,18 +176,18 @@ public:
     addCamera(
       "/camera/front/image_raw",
       cv::Matx44d(
-         0.0,  -0.9659258,  0.258812,   0.0,
-         1.0,  0.0,  0.0,   0.0,
-         0.0, 0.258812,  0.9659258,   0.0,
-         0.0,  0.0,  0.0,   1.0
+         0.0,  -0.9659258,  0.2588120,  0.0,
+         1.0,   0.0,        0.0,        0.0,
+         0.0,   0.2588120,  0.9659258,  0.0,
+         0.0,   0.0,        0.0,        1.0
       ),
       (cv::Mat_<double>(3, 3) <<
-        1124.88695074, 0.0, 940.64503038,
-        0.0, 1125.62691616, 596.589728436,
+        1103.60401999, 0.0, 946.547127394,
+        0.0, 1100.45084936, 598.302984461,
         0.0, 0.0, 1.0),
       (cv::Mat_<double>(1, 5) <<
-        0.00200788876647, -0.00431737190681, -0.00100624160092, 0.00220836062611, -0.0247552420162)
-    ); 
+        -0.00344874724739, -0.0394044158268, -0.00372898986636, 0.00277661293568, 0.0172371744751)
+    );
 
     addCamera(
       "/camera/down/image_raw",
@@ -148,7 +203,7 @@ public:
         0.0, 0.0, 1.0),
       (cv::Mat_<double>(1, 5) <<
         -0.00344874724739, -0.0394044158268, -0.00372898986636, 0.00277661293568, 0.0172371744751)
-    ); 
+    );
 
     const auto image_qos = rclcpp::SensorDataQoS().keep_last(1);
 
@@ -169,14 +224,14 @@ public:
     RCLCPP_INFO(
       this->get_logger(),
       "ArucoNanoPoseEstimator started. marker_length=%.6f, dictionary=%s, frame_id=%s, "
-      "period=%d ms, save_debug_images=%s, debug_output_dir=%s, slam_odom_topic=%s, "
+      "period=%d ms, preprocess_enable=%s, save_debug_images=%s, slam_odom_topic=%s, "
       "use_track_filter=%s",
       marker_length_,
       dictionary_name_.c_str(),
       drone_frame_id_.c_str(),
       processing_period_ms_,
+      preprocess_enable_ ? "true" : "false",
       save_debug_images_ ? "true" : "false",
-      debug_output_dir_.c_str(),
       slam_odom_topic_.c_str(),
       use_track_filter_ ? "true" : "false");
   }
@@ -211,8 +266,8 @@ private:
     std::string frame_id;
     std::string child_frame_id;
     cv::Vec3d p_world_body{0.0, 0.0, 0.0};
-    std::array<double, 4> q_world_body{0.0, 0.0, 0.0, 1.0};  // [x,y,z,w]
-    cv::Vec3d v_body{0.0, 0.0, 0.0};  // twist.linear in child frame
+    std::array<double, 4> q_world_body{0.0, 0.0, 0.0, 1.0};
+    cv::Vec3d v_body{0.0, 0.0, 0.0};
   };
 
   struct MarkerTrack
@@ -246,8 +301,27 @@ private:
     std::string label;
     geometry_msgs::msg::PoseStamped pose_msg;
     std::string source_topic;
-    std::string output_kind;  // "raw_measurement" or "filtered_measurement"
+    std::string output_kind;
     double reprojection_error_px{std::numeric_limits<double>::infinity()};
+  };
+
+  struct DetectionCandidateImage
+  {
+    std::string name;
+    cv::Mat detect_image;
+    cv::Mat refine_image;
+  };
+
+  struct DetectionSelection
+  {
+    bool valid{false};
+    std::string candidate_name{"none"};
+    cv::Mat refine_image;
+    std::vector<std::vector<cv::Point2f>> corners;
+    std::vector<int> ids;
+    int relevant_count{0};
+    int total_count{0};
+    double area_score{0.0};
   };
 
   std::map<std::string, std::shared_ptr<CameraState>> cameras_;
@@ -295,6 +369,23 @@ private:
   double kf_process_accel_sigma_{0.05};
   double kf_measurement_noise_floor_m_{0.03};
   double kf_speed_noise_scale_{0.3};
+
+  bool preprocess_enable_{false};
+  bool preprocess_try_original_first_{true};
+  bool preprocess_use_gamma_{false};
+  double preprocess_gamma_{1.35};
+  bool preprocess_use_clahe_{true};
+  double preprocess_clahe_clip_limit_{2.5};
+  int preprocess_clahe_tile_grid_size_{8};
+  bool preprocess_use_median_blur_{false};
+  int preprocess_median_blur_ksize_{5};
+  bool preprocess_use_adaptive_threshold_{true};
+  int preprocess_adaptive_block_size_{31};
+  double preprocess_adaptive_c_{5.0};
+  bool preprocess_use_otsu_threshold_{false};
+
+  cv::Ptr<cv::CLAHE> clahe_;
+  cv::Mat gamma_lut_;
 
   static int dictionaryNameToEnum(const std::string & name)
   {
@@ -368,6 +459,18 @@ private:
     return {q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm};
   }
 
+  static cv::Mat makeGammaLut(double gamma)
+  {
+    cv::Mat lut(1, 256, CV_8UC1);
+    for (int i = 0; i < 256; ++i) {
+      const double normalized = static_cast<double>(i) / 255.0;
+      const double corrected = std::pow(normalized, gamma);
+      lut.at<unsigned char>(0, i) = static_cast<unsigned char>(
+        std::round(std::clamp(corrected, 0.0, 1.0) * 255.0));
+    }
+    return lut;
+  }
+
   static cv::Matx33d quaternionToRotationMatrix(const std::array<double, 4> & q_in)
   {
     const auto q = normalizeQuaternion(q_in);
@@ -389,6 +492,14 @@ private:
       R(0, 0) * v[0] + R(0, 1) * v[1] + R(0, 2) * v[2],
       R(1, 0) * v[0] + R(1, 1) * v[1] + R(1, 2) * v[2],
       R(2, 0) * v[0] + R(2, 1) * v[1] + R(2, 2) * v[2]);
+  }
+
+  static double quadrilateralArea(const std::vector<cv::Point2f> & corners)
+  {
+    if (corners.size() < 4U) {
+      return 0.0;
+    }
+    return std::fabs(cv::contourArea(corners));
   }
 
   void addCamera(
@@ -477,6 +588,141 @@ private:
       }
 
       processImage(msg, topic_name, *camera);
+    }
+  }
+
+  void buildDetectionCandidates(
+    const cv::Mat & gray,
+    std::vector<DetectionCandidateImage> & candidates) const
+  {
+    candidates.clear();
+    candidates.reserve(5);
+
+    if (!preprocess_enable_) {
+      candidates.push_back({"gray_original", gray, gray});
+      return;
+    }
+
+    if (preprocess_try_original_first_) {
+      candidates.push_back({"gray_original", gray, gray});
+    }
+
+    cv::Mat enhanced = gray;
+    bool have_nontrivial_enhancement = false;
+
+    if (preprocess_use_gamma_) {
+      cv::LUT(enhanced, gamma_lut_, enhanced);
+      have_nontrivial_enhancement = true;
+    }
+
+    if (preprocess_use_clahe_ && clahe_) {
+      cv::Mat clahe_out;
+      clahe_->apply(enhanced, clahe_out);
+      enhanced = clahe_out;
+      have_nontrivial_enhancement = true;
+    }
+
+    if (preprocess_use_median_blur_) {
+      cv::Mat median_out;
+      cv::medianBlur(enhanced, median_out, preprocess_median_blur_ksize_);
+      enhanced = median_out;
+      have_nontrivial_enhancement = true;
+    }
+
+    if (have_nontrivial_enhancement || !preprocess_try_original_first_) {
+      candidates.push_back({"gray_enhanced", enhanced, enhanced});
+    }
+
+    if (preprocess_use_adaptive_threshold_) {
+      cv::Mat adaptive;
+      cv::adaptiveThreshold(
+        enhanced,
+        adaptive,
+        255,
+        cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv::THRESH_BINARY,
+        preprocess_adaptive_block_size_,
+        preprocess_adaptive_c_);
+      candidates.push_back({"adaptive_threshold", adaptive, enhanced});
+    }
+
+    if (preprocess_use_otsu_threshold_) {
+      cv::Mat otsu;
+      cv::threshold(
+        enhanced,
+        otsu,
+        0.0,
+        255.0,
+        cv::THRESH_BINARY | cv::THRESH_OTSU);
+      candidates.push_back({"otsu_threshold", otsu, enhanced});
+    }
+
+    if (candidates.empty()) {
+      candidates.push_back({"gray_original", gray, gray});
+    }
+  }
+
+  void selectBestDetection(
+    const cv::Mat & gray,
+    DetectionSelection & best_selection)
+  {
+    best_selection = DetectionSelection{};
+    best_selection.refine_image = gray;
+
+    std::vector<DetectionCandidateImage> candidates;
+    buildDetectionCandidates(gray, candidates);
+
+    for (const auto & candidate : candidates) {
+      std::vector<std::vector<cv::Point2f>> corners;
+      std::vector<int> ids;
+
+      detector_->detectMarkers(candidate.detect_image, corners, ids);
+
+      int relevant_count = 0;
+      double area_score = 0.0;
+
+      for (size_t i = 0; i < ids.size(); ++i) {
+        if (marker_labels_.find(ids[i]) != marker_labels_.end()) {
+          ++relevant_count;
+        }
+        area_score += quadrilateralArea(corners[i]);
+      }
+
+      const int total_count = static_cast<int>(ids.size());
+
+      bool replace = false;
+      if (!best_selection.valid && total_count > 0) {
+        replace = true;
+      } else if (relevant_count > best_selection.relevant_count) {
+        replace = true;
+      } else if (
+        relevant_count == best_selection.relevant_count &&
+        total_count > best_selection.total_count)
+      {
+        replace = true;
+      } else if (
+        relevant_count == best_selection.relevant_count &&
+        total_count == best_selection.total_count &&
+        area_score > best_selection.area_score)
+      {
+        replace = true;
+      }
+
+      if (replace) {
+        best_selection.valid = true;
+        best_selection.candidate_name = candidate.name;
+        best_selection.refine_image = candidate.refine_image;
+        best_selection.corners = std::move(corners);
+        best_selection.ids = std::move(ids);
+        best_selection.relevant_count = relevant_count;
+        best_selection.total_count = total_count;
+        best_selection.area_score = area_score;
+      }
+    }
+
+    if (!best_selection.valid && !candidates.empty()) {
+      best_selection.candidate_name = candidates.front().name;
+      best_selection.refine_image = candidates.front().refine_image;
     }
   }
 
@@ -806,6 +1052,7 @@ private:
     const cv::Mat & debug_bgr,
     const std::string & output_path,
     const std::string & topic_name,
+    const std::string & preprocessing_variant_name,
     const std::vector<std::vector<cv::Point2f>> & valid_corners,
     const std::vector<int> & valid_ids,
     const std::vector<cv::Vec3d> & rvecs,
@@ -859,14 +1106,15 @@ private:
     std::ostringstream header_line;
     header_line << "Aruco Nano | Topic: " << topic_name
                 << " | Valid markers: " << valid_ids.size()
-                << " | Frame: " << drone_frame_id_;
+                << " | Frame: " << drone_frame_id_
+                << " | Prep: " << preprocessing_variant_name;
 
     cv::putText(
       annotated,
       header_line.str(),
       cv::Point(20, 30),
       cv::FONT_HERSHEY_SIMPLEX,
-      0.7,
+      0.6,
       cv::Scalar(0, 255, 0),
       2,
       cv::LINE_AA);
@@ -1017,7 +1265,6 @@ private:
       return;
     }
 
-    cv::Mat detector_input;
     cv::Mat debug_bgr;
     cv::Mat gray;
     const bool need_debug_image = save_debug_images_;
@@ -1026,41 +1273,35 @@ private:
       const auto & enc = msg->encoding;
 
       if (enc == sensor_msgs::image_encodings::MONO8) {
-        detector_input = cv_ptr->image;
         gray = cv_ptr->image;
         if (need_debug_image) {
           cv::cvtColor(cv_ptr->image, debug_bgr, cv::COLOR_GRAY2BGR);
         }
       } else if (enc == sensor_msgs::image_encodings::BGR8) {
-        detector_input = cv_ptr->image;
-        cv::cvtColor(detector_input, gray, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(cv_ptr->image, gray, cv::COLOR_BGR2GRAY);
         if (need_debug_image) {
-          debug_bgr = detector_input.clone();
+          debug_bgr = cv_ptr->image.clone();
         }
       } else if (enc == sensor_msgs::image_encodings::RGB8) {
-        cv::cvtColor(cv_ptr->image, detector_input, cv::COLOR_RGB2BGR);
-        cv::cvtColor(detector_input, gray, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(cv_ptr->image, gray, cv::COLOR_RGB2GRAY);
         if (need_debug_image) {
-          debug_bgr = detector_input.clone();
+          cv::cvtColor(cv_ptr->image, debug_bgr, cv::COLOR_RGB2BGR);
         }
       } else if (enc == sensor_msgs::image_encodings::BGRA8) {
-        cv::cvtColor(cv_ptr->image, detector_input, cv::COLOR_BGRA2BGR);
-        cv::cvtColor(detector_input, gray, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(cv_ptr->image, gray, cv::COLOR_BGRA2GRAY);
         if (need_debug_image) {
-          debug_bgr = detector_input.clone();
+          cv::cvtColor(cv_ptr->image, debug_bgr, cv::COLOR_BGRA2BGR);
         }
       } else if (enc == sensor_msgs::image_encodings::RGBA8) {
-        cv::cvtColor(cv_ptr->image, detector_input, cv::COLOR_RGBA2BGR);
-        cv::cvtColor(detector_input, gray, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(cv_ptr->image, gray, cv::COLOR_RGBA2GRAY);
         if (need_debug_image) {
-          debug_bgr = detector_input.clone();
+          cv::cvtColor(cv_ptr->image, debug_bgr, cv::COLOR_RGBA2BGR);
         }
       } else {
         auto bgr_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-        detector_input = bgr_ptr->image;
-        cv::cvtColor(detector_input, gray, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(bgr_ptr->image, gray, cv::COLOR_BGR2GRAY);
         if (need_debug_image) {
-          debug_bgr = detector_input.clone();
+          debug_bgr = bgr_ptr->image.clone();
         }
       }
     } catch (const cv_bridge::Exception & e) {
@@ -1070,17 +1311,18 @@ private:
       return;
     }
 
-    std::vector<std::vector<cv::Point2f>> corners;
-    std::vector<int> ids;
-
+    DetectionSelection detection_selection;
     try {
-      detector_->detectMarkers(detector_input, corners, ids);
+      selectBestDetection(gray, detection_selection);
     } catch (const std::exception & e) {
       RCLCPP_ERROR_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
         "Aruco Nano detection failed for %s: %s", topic_name.c_str(), e.what());
       return;
     }
+
+    std::vector<std::vector<cv::Point2f>> corners = detection_selection.corners;
+    std::vector<int> ids = detection_selection.ids;
 
     if (ids.empty()) {
       std::string debug_output_path;
@@ -1089,6 +1331,7 @@ private:
           debug_bgr,
           debug_output_path,
           topic_name,
+          detection_selection.candidate_name,
           {},
           {},
           {},
@@ -1099,7 +1342,7 @@ private:
       return;
     }
 
-    refineCornersSubpixel(gray, corners);
+    refineCornersSubpixel(detection_selection.refine_image, corners);
 
     std::vector<std::vector<cv::Point2f>> valid_corners;
     std::vector<int> valid_ids;
@@ -1215,6 +1458,7 @@ private:
         debug_bgr,
         debug_output_path,
         topic_name,
+        detection_selection.candidate_name,
         valid_corners,
         valid_ids,
         rvecs,
