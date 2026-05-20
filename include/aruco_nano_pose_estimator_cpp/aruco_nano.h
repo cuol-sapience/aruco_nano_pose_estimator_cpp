@@ -179,7 +179,7 @@ struct DetectorParameters {
     float maxTimesRevisited=0.05; //1 equals tradional algo,
     /// number of bits of the marker border, i.e. marker border width (default 1).
     float  markerBorderBits=1; //i do not see this useful. all dicts have 1 border bit but its used in opencv  aruco and I keep it here
-    double errorCorrectionRate=0;//The default 0.6 value in aruco opencv is very dangerous. It causes many false positives.
+    double errorCorrectionRate=0.3;//The default 0.6 value in aruco opencv is very dangerous. It causes many false positives.
     double maxErroneousBitsInBorderRate=0;//maximum rate of erroneous bits in the border. Default 0 means no error allowed.
     bool detectInvertedMarker=false;//if the markers are printed in white over black background
 };
