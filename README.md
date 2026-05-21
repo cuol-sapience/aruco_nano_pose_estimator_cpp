@@ -2,6 +2,9 @@
 
 ROS 2 Humble C++ node for ArUco marker detection and pose estimation using **Aruco Nano**.
 
+
+TO CHANGE PARAMS LINKED TO DETECTION, CHECK THE HEADER FILE aruco_nano.h
+
 The node:
 - subscribes to one or more camera image topics,
 - detects ArUco markers with ArUco Nano,
