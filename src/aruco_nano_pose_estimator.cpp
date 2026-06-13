@@ -4,6 +4,11 @@
 // Target: ROS 2 Humble / Iron / Jazzy, OpenCV 4.7+ (for solvePnPGeneric +
 // SOLVEPNP_IPPE_SQUARE), Jetson Orin Nano with JetPack 5.1.x or 6.x.
 //
+// Camera input: GStreamer direct via raw appsink API + NvBufSurface (NVMM).
+// Configure pipelines via ROS parameters camera_front_pipeline and
+// camera_down_pipeline. Leave camera_down_pipeline empty to disable the
+// down camera.
+//
 // Companion to aruco_nano.h (Rafael Munoz-Salinas, v10, header-only). The
 // header is used as-is; we configure it through DetectorParameters.
 //
@@ -36,13 +41,10 @@
 // =============================================================================
 
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/image.hpp>
-#include <sensor_msgs/image_encodings.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <builtin_interfaces/msg/time.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <cv_bridge/cv_bridge.h>
 
 #include <opencv2/aruco.hpp>
 #include <opencv2/calib3d.hpp>
@@ -50,11 +52,16 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/video/tracking.hpp>
+// GStreamer + Jetson NVMM (direct buffer access, avoids DMA copy to system RAM)
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include <nvbufsurface.h>
 
 #include "aruco_nano_pose_estimator_cpp/aruco_nano.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cctype>
@@ -67,6 +74,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 class ArucoNanoPoseEstimator : public rclcpp::Node
@@ -97,18 +105,12 @@ public:
     use_iterative_pnp_ = this->declare_parameter<bool>("use_iterative_pnp", true);
     max_reprojection_error_px_ = this->declare_parameter<double>("max_reprojection_error_px", 4.0);
 
-    // Static-landmark world-position random-walk: sigma in m/sqrt(s).
-    // For a static marker the value is small; it sets how fast the
-    // covariance grows when the marker is out of view.
     kf_process_pos_rate_sigma_ =
       this->declare_parameter<double>("kf_process_pos_rate_sigma", 0.05);
     kf_measurement_noise_floor_m_ =
       this->declare_parameter<double>("kf_measurement_noise_floor_m", 0.03);
     kf_speed_noise_scale_ = this->declare_parameter<double>("kf_speed_noise_scale", 0.3);
 
-    // Ratio (depth sigma) / (lateral sigma) clamp. Theoretical scaling for
-    // planar marker pose gives the depth sigma as much larger than lateral;
-    // this is a safety floor.
     kf_depth_to_lateral_ratio_min_ =
       this->declare_parameter<double>("kf_depth_to_lateral_ratio_min", 3.0);
 
@@ -147,6 +149,27 @@ public:
     preprocess_use_otsu_threshold_ =
       this->declare_parameter<bool>("preprocess_use_otsu_threshold", false);
 
+    // GStreamer pipeline strings. nvvidconv (Jetson VIC hardware block) converts
+    // NV12→GRAY8 at zero CPU cost. The output stays in NVMM (Jetson unified
+    // memory) so no DMA copy to system RAM occurs; the capture thread maps the
+    // buffer directly into cv::Mat via NvBufSurface. Leave camera_down_pipeline
+    // empty to disable the down camera. Custom pipelines must name the appsink
+    // element "appsink0".
+    camera_front_pipeline_ = this->declare_parameter<std::string>(
+      "camera_front_pipeline",
+      "nvarguscamerasrc sensor-id=0 ispdigitalgainrange=\"1 8\" aelock=true"
+      " ! video/x-raw(memory:NVMM),width=1920,height=1200,framerate=12/1,format=NV12"
+      " ! nvvidconv"
+      " ! video/x-raw(memory:NVMM),format=GRAY8"
+      " ! appsink name=appsink0 drop=true max-buffers=1 sync=false");
+    camera_down_pipeline_ = this->declare_parameter<std::string>(
+      "camera_down_pipeline",
+      "nvarguscamerasrc sensor-id=1 ispdigitalgainrange=\"1 8\" aelock=true"
+      " ! video/x-raw(memory:NVMM),width=1920,height=1200,framerate=12/1,format=NV12"
+      " ! nvvidconv"
+      " ! video/x-raw(memory:NVMM),format=GRAY8"
+      " ! appsink name=appsink0 drop=true max-buffers=1 sync=false");
+
     validateParameters();
 
     if (save_debug_images_) {
@@ -171,7 +194,6 @@ public:
     marker_labels_[1] = "Medical";
     marker_labels_[2] = "Supply";
 
-    // Configure aruco_nano via DetectorParameters.
     dictionary_ = cv::aruco::getPredefinedDictionary(dictionaryNameToEnum(dictionary_name_));
     aruco_nano::DetectorParameters det_params;
     det_params.dicts = { dictionary_ };
@@ -181,7 +203,6 @@ public:
     det_params.maxAttemptsPerCandidate = aruco_max_attempts_per_candidate_;
     det_params.errorCorrectionRate = aruco_error_correction_rate_;
     det_params.detectInvertedMarker = aruco_detect_inverted_marker_;
-    // Use the vector ctor so aruco_nano does not append our dict again.
     detector_ = std::make_unique<aruco_nano::ArucoDetector>(det_params.dicts, det_params);
 
     pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
@@ -198,8 +219,10 @@ public:
       rclcpp::QoS(50),
       std::bind(&ArucoNanoPoseEstimator::slamOdomCallback, this, std::placeholders::_1));
 
+    gst_init(nullptr, nullptr);
+
     addCamera(
-      "/camera/front/image_raw",
+      "front", camera_front_pipeline_,
       cv::Matx44d(
          0.0, -0.57357644,  0.81915204,  0.0,
          1.0,  0.0,         0.0,         0.0,
@@ -213,28 +236,21 @@ public:
         0.02717223068021268, -0.060021841339080874, 0.0007009591920443065,
         -4.569105989855734e-05, 0.020871849677932104));
 
-    addCamera(
-      "/camera/down/image_raw",
-      cv::Matx44d(
-         0.0, -1.0, 0.0, 0.0,
-         1.0,  0.0, 0.0, 0.0,
-         0.0,  0.0, 1.0, 0.0,
-         0.0,  0.0, 0.0, 1.0),
-      (cv::Mat_<double>(3, 3) <<
-        1134.3171058472644, 0.0, 945.03097055585,
-        0.0, 1134.9884203778502, 607.0921091018031,
-        0.0, 0.0, 1.0),
-      (cv::Mat_<double>(1, 5) <<
-        0.02717223068021268, -0.060021841339080874, 0.0007009591920443065,
-        -4.569105989855734e-05, 0.020871849677932104));
-
-    const auto image_qos = rclcpp::SensorDataQoS().keep_last(1);
-    for (auto & [topic, camera] : cameras_) {
-      camera->sub = this->create_subscription<sensor_msgs::msg::Image>(
-        topic, image_qos,
-        [this, topic](sensor_msgs::msg::Image::ConstSharedPtr msg) {
-          this->storeLatestImage(msg, topic);
-        });
+    if (!camera_down_pipeline_.empty()) {
+      addCamera(
+        "down", camera_down_pipeline_,
+        cv::Matx44d(
+           0.0, -1.0, 0.0, 0.0,
+           1.0,  0.0, 0.0, 0.0,
+           0.0,  0.0, 1.0, 0.0,
+           0.0,  0.0, 0.0, 1.0),
+        (cv::Mat_<double>(3, 3) <<
+          1134.3171058472644, 0.0, 945.03097055585,
+          0.0, 1134.9884203778502, 607.0921091018031,
+          0.0, 0.0, 1.0),
+        (cv::Mat_<double>(1, 5) <<
+          0.02717223068021268, -0.060021841339080874, 0.0007009591920443065,
+          -4.569105989855734e-05, 0.020871849677932104));
     }
 
     processing_timer_ = this->create_wall_timer(
@@ -243,10 +259,10 @@ public:
 
     RCLCPP_INFO(
       this->get_logger(),
-      "ArucoNanoPoseEstimator (position-only) started. marker_length=%.6f, "
-      "dictionary=%s, frame_id=%s, period=%d ms, preprocess_enable=%s, "
-      "save_debug_images=%s, slam_odom_topic=%s, use_track_filter=%s, "
-      "aruco_error_correction_rate=%.2f",
+      "ArucoNanoPoseEstimator (GStreamer direct, position-only) started. "
+      "marker_length=%.6f, dictionary=%s, frame_id=%s, period=%d ms, "
+      "preprocess_enable=%s, save_debug_images=%s, slam_odom_topic=%s, "
+      "use_track_filter=%s, aruco_error_correction_rate=%.2f",
       marker_length_, dictionary_name_.c_str(), drone_frame_id_.c_str(),
       processing_period_ms_,
       preprocess_enable_ ? "true" : "false",
@@ -254,6 +270,18 @@ public:
       slam_odom_topic_.c_str(),
       use_track_filter_ ? "true" : "false",
       aruco_error_correction_rate_);
+  }
+
+  ~ArucoNanoPoseEstimator()
+  {
+    for (auto & [name, camera] : cameras_) {
+      camera->capture_running.store(false);
+    }
+    for (auto & [name, camera] : cameras_) {
+      if (camera->capture_thread.joinable()) {
+        camera->capture_thread.join();
+      }
+    }
   }
 
 private:
@@ -270,10 +298,13 @@ private:
     CameraCalibration calibration;
     cv::Matx44d T_drone_camera = cv::Matx44d::eye();
 
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub;
+    std::string gst_pipeline;
+    std::atomic<bool> capture_running{false};
+    std::thread capture_thread;
 
-    sensor_msgs::msg::Image::ConstSharedPtr latest_msg;
-    std::mutex latest_msg_mutex;
+    cv::Mat latest_frame;
+    double latest_frame_stamp_sec{-1.0};
+    std::mutex latest_msg_mutex;  // guards latest_frame and latest_frame_stamp_sec
 
     std::string debug_topic_tag;
     std::mutex debug_state_mutex;
@@ -281,14 +312,11 @@ private:
     uint64_t debug_image_sequence{0U};
   };
 
-  // Body pose in the world from SLAM odometry. The orientation here is the
-  // BODY's orientation in the world; we still need it to express marker
-  // positions in world coordinates. It is NOT the marker's orientation.
   struct SlamOdomSample
   {
     double t_sec{0.0};
     cv::Vec3d p_world_body{0.0, 0.0, 0.0};
-    std::array<double, 4> q_world_body{0.0, 0.0, 0.0, 1.0};  // (x, y, z, w)
+    std::array<double, 4> q_world_body{0.0, 0.0, 0.0, 1.0};
     cv::Vec3d v_body{0.0, 0.0, 0.0};
   };
 
@@ -301,8 +329,6 @@ private:
     cv::Vec3d v_body{0.0, 0.0, 0.0};
   };
 
-  // 3-state Kalman filter tracking marker POSITION in the world frame.
-  // No orientation is stored; we only need where the marker is.
   struct MarkerTrack
   {
     bool initialized{false};
@@ -419,6 +445,9 @@ private:
   double preprocess_adaptive_c_{5.0};
   bool preprocess_use_otsu_threshold_{false};
 
+  std::string camera_front_pipeline_;   // must output GRAY8 (preferred) or BGR
+  std::string camera_down_pipeline_;    // empty = disabled
+
   cv::Ptr<cv::CLAHE> clahe_;
   cv::Mat gamma_lut_;
 
@@ -452,11 +481,11 @@ private:
     return it->second;
   }
 
-  static std::string sanitizeTopicName(const std::string & topic)
+  static std::string sanitizeName(const std::string & name)
   {
     std::string sanitized;
-    sanitized.reserve(topic.size());
-    for (char ch : topic) {
+    sanitized.reserve(name.size());
+    for (char ch : name) {
       sanitized.push_back(std::isalnum(static_cast<unsigned char>(ch)) ? ch : '_');
     }
     while (!sanitized.empty() && sanitized.front() == '_') {
@@ -489,9 +518,6 @@ private:
     return {q[0]/n, q[1]/n, q[2]/n, q[3]/n};
   }
 
-  // SLERP between two unit quaternions (x, y, z, w). Used ONLY for
-  // interpolating the SLAM body orientation between odom samples - this is
-  // a body-frame interpolation, not a marker-orientation filter.
   static std::array<double, 4> slerpQuaternion(
     const std::array<double, 4> & q0_in,
     const std::array<double, 4> & q1_in,
@@ -630,18 +656,133 @@ private:
       throw std::runtime_error("preprocess_adaptive_block_size must be an odd integer > 1");
   }
 
-  // ---- Camera registration -------------------------------------------------
+  // ---- Camera registration & GStreamer capture -----------------------------
 
   void addCamera(
-    const std::string & topic, const cv::Matx44d & T_drone_camera,
+    const std::string & name, const std::string & gst_pipeline,
+    const cv::Matx44d & T_drone_camera,
     const cv::Mat & camera_matrix, const cv::Mat & dist_coeffs)
   {
     auto camera = std::make_shared<CameraState>();
     camera->T_drone_camera = T_drone_camera;
     camera->calibration.camera_matrix = camera_matrix.clone();
     camera->calibration.dist_coeffs = dist_coeffs.clone();
-    camera->debug_topic_tag = sanitizeTopicName(topic);
-    cameras_[topic] = camera;
+    camera->gst_pipeline = gst_pipeline;
+    camera->debug_topic_tag = sanitizeName(name);
+    cameras_[name] = camera;
+
+    camera->capture_running.store(true);
+    camera->capture_thread = std::thread(
+      &ArucoNanoPoseEstimator::captureLoop, this, name, camera);
+  }
+
+  void captureLoop(const std::string & camera_name, std::shared_ptr<CameraState> camera)
+  {
+    GError * gerr = nullptr;
+    GstElement * pipeline = gst_parse_launch(camera->gst_pipeline.c_str(), &gerr);
+    if (!pipeline) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "Camera '%s': failed to parse pipeline: %s. Pipeline: %s",
+        camera_name.c_str(),
+        gerr ? gerr->message : "unknown error",
+        camera->gst_pipeline.c_str());
+      if (gerr) g_error_free(gerr);
+      camera->capture_running.store(false);
+      return;
+    }
+    if (gerr) { g_error_free(gerr); gerr = nullptr; }
+
+    GstElement * appsink = gst_bin_get_by_name(GST_BIN(pipeline), "appsink0");
+    if (!appsink) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "Camera '%s': pipeline must contain an appsink with name=appsink0",
+        camera_name.c_str());
+      gst_object_unref(pipeline);
+      camera->capture_running.store(false);
+      return;
+    }
+
+    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "Camera '%s': failed to set pipeline to PLAYING", camera_name.c_str());
+      gst_object_unref(appsink);
+      gst_object_unref(pipeline);
+      camera->capture_running.store(false);
+      return;
+    }
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "GStreamer pipeline started for camera '%s'", camera_name.c_str());
+
+    while (camera->capture_running.load()) {
+      // 50 ms timeout so the destructor can stop the thread promptly
+      GstSample * sample = gst_app_sink_try_pull_sample(
+        GST_APP_SINK(appsink), 50 * GST_MSECOND);
+      if (!sample) continue;
+
+      GstBuffer * buffer = gst_sample_get_buffer(sample);
+      GstCaps * caps = gst_sample_get_caps(sample);
+
+      if (buffer && caps) {
+        GstStructure * st = gst_caps_get_structure(caps, 0);
+        int width = 0, height = 0;
+        gst_structure_get_int(st, "width", &width);
+        gst_structure_get_int(st, "height", &height);
+
+        if (width > 0 && height > 0) {
+          cv::Mat frame;
+
+          GstCapsFeatures * features = gst_caps_get_features(caps, 0);
+          const bool is_nvmm =
+            features && gst_caps_features_contains(features, "memory:NVMM");
+
+          if (is_nvmm) {
+            // Map the NVMM buffer into CPU address space via NvBufSurface.
+            // This is a cache-coherent mapping with no DMA copy to system RAM.
+            GstMapInfo map = GST_MAP_INFO_INIT;
+            if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+              NvBufSurface * surf = reinterpret_cast<NvBufSurface *>(map.data);
+              if (NvBufSurfaceMap(surf, 0, 0, NVBUF_MAP_READ) == 0) {
+                // pitch[0] is bytes-per-row for plane 0 (Y/GRAY8 = only plane)
+                const size_t pitch = surf->surfaceList[0].pitch;
+                void * y_ptr = surf->surfaceList[0].mappedAddr.addr[0];
+                const cv::Mat tmp(height, width, CV_8UC1, y_ptr, pitch);
+                frame = tmp.clone();  // one clone to own data before unmap
+                NvBufSurfaceUnMap(surf, 0, 0);
+              }
+              gst_buffer_unmap(buffer, &map);
+            }
+          } else {
+            // Non-NVMM fallback (e.g. custom pipeline outputting to system RAM)
+            GstMapInfo map = GST_MAP_INFO_INIT;
+            if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+              const gchar * fmt = gst_structure_get_string(st, "format");
+              const bool gray = fmt && (g_strcmp0(fmt, "GRAY8") == 0);
+              const cv::Mat tmp(height, width, gray ? CV_8UC1 : CV_8UC3, map.data);
+              frame = tmp.clone();
+              gst_buffer_unmap(buffer, &map);
+            }
+          }
+
+          if (!frame.empty()) {
+            const double stamp_sec = this->now().seconds();
+            std::lock_guard<std::mutex> lock(camera->latest_msg_mutex);
+            camera->latest_frame = std::move(frame);
+            camera->latest_frame_stamp_sec = stamp_sec;
+          }
+        }
+      }
+      gst_sample_unref(sample);
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(appsink);
+    gst_object_unref(pipeline);
+    camera->capture_running.store(false);
   }
 
   // ---- Odometry buffer & interpolation -------------------------------------
@@ -737,21 +878,7 @@ private:
     return std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
   }
 
-  // ---- Image plumbing ------------------------------------------------------
-
-  void storeLatestImage(
-    const sensor_msgs::msg::Image::ConstSharedPtr & msg, const std::string & topic_name)
-  {
-    const auto it = cameras_.find(topic_name);
-    if (it == cameras_.end()) {
-      RCLCPP_ERROR_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "Received image for unknown topic: %s", topic_name.c_str());
-      return;
-    }
-    std::lock_guard<std::mutex> lock(it->second->latest_msg_mutex);
-    it->second->latest_msg = msg;
-  }
+  // ---- Timer & frame dispatch ----------------------------------------------
 
   void onTimer()
   {
@@ -764,15 +891,17 @@ private:
 
   void processLatestFrames()
   {
-    for (auto & [topic_name, camera] : cameras_) {
-      sensor_msgs::msg::Image::ConstSharedPtr msg;
+    for (auto & [camera_name, camera] : cameras_) {
+      cv::Mat frame;
+      double stamp_sec = -1.0;
       {
         std::lock_guard<std::mutex> lock(camera->latest_msg_mutex);
-        if (!camera->latest_msg) continue;
-        msg = camera->latest_msg;
-        camera->latest_msg.reset();
+        if (camera->latest_frame.empty() || camera->latest_frame_stamp_sec < 0.0) continue;
+        frame = camera->latest_frame;
+        stamp_sec = camera->latest_frame_stamp_sec;
+        camera->latest_frame = cv::Mat{};  // consume
       }
-      processImage(msg, topic_name, *camera);
+      processImage(frame, stamp_sec, camera_name, *camera);
     }
   }
 
@@ -871,14 +1000,13 @@ private:
   }
 
   bool shouldSaveDebugImage(
-    const sensor_msgs::msg::Image::ConstSharedPtr & msg,
-    CameraState & camera, bool has_valid_detections, std::string & output_path)
+    double stamp_sec, CameraState & camera,
+    bool has_valid_detections, std::string & output_path)
   {
     output_path.clear();
     if (!save_debug_images_) return false;
     if (debug_save_only_with_valid_detections_ && !has_valid_detections) return false;
 
-    const double stamp_sec = timeMsgToSec(msg->header.stamp);
     std::lock_guard<std::mutex> lock(camera.debug_state_mutex);
     if (debug_max_save_rate_hz_ > 0.0 && camera.last_debug_save_time_sec >= 0.0) {
       const double min_dt = 1.0 / debug_max_save_rate_hz_;
@@ -886,11 +1014,16 @@ private:
     }
     camera.last_debug_save_time_sec = stamp_sec;
     const uint64_t seq = camera.debug_image_sequence++;
+
+    const int64_t t_ns = static_cast<int64_t>(stamp_sec * 1e9);
+    const long long sec_part = t_ns / 1000000000LL;
+    const unsigned long long ns_part = static_cast<unsigned long long>(t_ns % 1000000000LL);
+
     std::ostringstream oss;
     oss << debug_output_dir_ << "/"
         << camera.debug_topic_tag << "_"
-        << static_cast<long long>(msg->header.stamp.sec) << "_"
-        << std::setw(9) << std::setfill('0') << msg->header.stamp.nanosec << "_"
+        << sec_part << "_"
+        << std::setw(9) << std::setfill('0') << ns_part << "_"
         << std::setw(6) << std::setfill('0') << seq << "_"
         << (has_valid_detections ? "detected" : "processed") << ".png";
     output_path = oss.str();
@@ -899,16 +1032,14 @@ private:
 
   // ---- Pose estimation core ------------------------------------------------
 
-  // Object points in the marker frame: x-right, y-up, z-out-of-marker.
-  // Ordering matches aruco_nano's returned corner order.
   static std::vector<cv::Point3f> makeMarkerObjectPoints(double marker_length)
   {
     const float s = static_cast<float>(marker_length / 2.0);
     return {
-      cv::Point3f(-s,  s, 0.0f),   // 0: top-left
-      cv::Point3f( s,  s, 0.0f),   // 1: top-right
-      cv::Point3f( s, -s, 0.0f),   // 2: bottom-right
-      cv::Point3f(-s, -s, 0.0f)};  // 3: bottom-left
+      cv::Point3f(-s,  s, 0.0f),
+      cv::Point3f( s,  s, 0.0f),
+      cv::Point3f( s, -s, 0.0f),
+      cv::Point3f(-s, -s, 0.0f)};
   }
 
   static double computeReprojectionError(
@@ -927,22 +1058,6 @@ private:
     return std::sqrt(sq / static_cast<double>(image_corners.size()));
   }
 
-  // Estimate marker pose with IPPE_SQUARE (returns up to 2 solutions for
-  // planar markers), then disambiguate. We need to disambiguate even though
-  // we only output position, because the two solutions differ in translation
-  // too - picking the wrong one gives the wrong position.
-  //
-  // Optional ITERATIVE refinement runs only from the chosen seed and is
-  // rejected if it would flip the marker normal or drift far from the prior.
-  //
-  // prior_position_camera: if non-null, the predicted marker centre in the
-  // current camera frame (from the KF transformed through current odom).
-  // This is the most reliable disambiguator.
-  // NOTE: deliberately NOT a const member function. RCLCPP_WARN_THROTTLE in
-  // ROS 2 Humble expands to clock.now(), which is non-const on
-  // rclcpp::Clock; calling it from a const method (which gets a const Clock
-  // via *this->get_clock()) fails to compile. The function reads members
-  // only, so dropping const is safe and surgical.
   bool estimateMarkerPoseRefined(
     const std::vector<cv::Point2f> & image_corners,
     const CameraState & camera,
@@ -982,9 +1097,6 @@ private:
       c.err = (i < static_cast<int>(reproj_errs.size())) ? reproj_errs[i]
               : computeReprojectionError(object_points, image_corners, c.r, c.t, K, D);
       cv::Mat R; cv::Rodrigues(c.r, R);
-      // Marker normal in camera frame is the third column of R. For the
-      // marker's front to face the camera (camera looks along +z), the
-      // normal's z-component should be negative.
       c.normal_ok = (R.at<double>(2, 2) < 0.0);
       if (prior_position_camera != nullptr) {
         c.prior_dist = cv::norm(c.t - *prior_position_camera);
@@ -1068,7 +1180,7 @@ private:
   {
     if (!track.initialized) return;
     const double dt = target_t_sec - track.last_prediction_t_sec;
-    if (dt <= 1e-6) return;  // also catches dt < 0 (out-of-order updates)
+    if (dt <= 1e-6) return;
 
     track.kf.transitionMatrix = cv::Mat::eye(3, 3, CV_64F);
     const double sigma_pos_rate =
@@ -1079,12 +1191,6 @@ private:
     track.last_prediction_t_sec = target_t_sec;
   }
 
-  // Build a 3x3 measurement covariance for the marker centre in the world
-  // frame. We model per-corner pixel noise as the reprojection RMS and
-  // propagate it to (lateral, depth) sigmas in the camera frame:
-  //   sigma_lat   ~ (depth * sigma_px) / focal
-  //   sigma_depth ~ (depth^2 * sigma_px) / (focal * marker_size_eff)
-  // Then rotate this diagonal camera-frame covariance into the world frame.
   cv::Mat buildMeasurementCovWorld(
     const CameraState & camera, const cv::Matx44d & T_world_camera,
     double depth_m, double reproj_rms_px) const
@@ -1107,7 +1213,6 @@ private:
       0.0, sigma_lat * sigma_lat, 0.0,
       0.0, 0.0, sigma_dep * sigma_dep);
 
-    // R = camera->world rotation (top-left 3x3 of T_world_camera).
     cv::Matx33d R(
       T_world_camera(0, 0), T_world_camera(0, 1), T_world_camera(0, 2),
       T_world_camera(1, 0), T_world_camera(1, 1), T_world_camera(1, 2),
@@ -1143,9 +1248,6 @@ private:
 
   // ---- Publishing & lifecycle ----------------------------------------------
 
-  // Build a PoseStamped with the given position in the drone frame.
-  // Orientation is set to identity (the contract is: only position is
-  // meaningful; downstream consumers must ignore orientation).
   geometry_msgs::msg::PoseStamped positionToPoseStamped(
     const cv::Vec3d & p_drone, const builtin_interfaces::msg::Time & stamp) const
   {
@@ -1170,14 +1272,14 @@ private:
   void registerMeasurementCandidate(
     int marker_id, const std::string & label,
     const geometry_msgs::msg::PoseStamped & pose_msg,
-    const std::string & source_topic, const std::string & output_kind,
+    const std::string & source_name, const std::string & output_kind,
     double reprojection_error_px)
   {
     auto it = cycle_measurement_candidates_.find(marker_id);
     if (it == cycle_measurement_candidates_.end()) {
       CycleMeasurementCandidate c;
       c.valid = true; c.marker_id = marker_id; c.label = label;
-      c.pose_msg = pose_msg; c.source_topic = source_topic;
+      c.pose_msg = pose_msg; c.source_topic = source_name;
       c.output_kind = output_kind; c.reprojection_error_px = reprojection_error_px;
       cycle_measurement_candidates_[marker_id] = c;
       return;
@@ -1190,7 +1292,7 @@ private:
              reprojection_error_px < it->second.reprojection_error_px) replace = true;
     if (replace) {
       it->second.valid = true; it->second.marker_id = marker_id; it->second.label = label;
-      it->second.pose_msg = pose_msg; it->second.source_topic = source_topic;
+      it->second.pose_msg = pose_msg; it->second.source_topic = source_name;
       it->second.output_kind = output_kind;
       it->second.reprojection_error_px = reprojection_error_px;
     }
@@ -1199,7 +1301,7 @@ private:
   void publishPoseAndInfo(
     int marker_id, const std::string & label,
     const geometry_msgs::msg::PoseStamped & pose_msg,
-    const std::string & source_topic, const std::string & output_kind)
+    const std::string & source_name, const std::string & output_kind)
   {
     pose_pub_->publish(pose_msg);
     if (type_pub_->get_subscription_count() > 0U) {
@@ -1211,7 +1313,7 @@ private:
       oss << std::fixed << std::setprecision(3)
           << "Marker ID: " << marker_id
           << ", Type: " << label
-          << ", Source: " << source_topic
+          << ", Source: " << source_name
           << ", Detector: aruco_nano"
           << ", Output: " << output_kind
           << ", Frame: " << drone_frame_id_
@@ -1291,46 +1393,26 @@ private:
   // ---- Main per-image processing -------------------------------------------
 
   void processImage(
-    const sensor_msgs::msg::Image::ConstSharedPtr & msg,
-    const std::string & topic_name, CameraState & camera)
+    const cv::Mat & input_frame, double stamp_sec,
+    const std::string & camera_name, CameraState & camera)
   {
-    cv_bridge::CvImageConstPtr cv_ptr;
-    try {
-      cv_ptr = cv_bridge::toCvShare(msg, msg->encoding);
-    } catch (const cv_bridge::Exception & e) {
-      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "cv_bridge failed for %s: %s", topic_name.c_str(), e.what());
-      return;
+    // Accept either GRAY8 (from hardware VIC via nvvidconv) or BGR (custom pipeline).
+    cv::Mat gray;
+    if (input_frame.channels() == 1) {
+      gray = input_frame;
+    } else {
+      cv::cvtColor(input_frame, gray, cv::COLOR_BGR2GRAY);
     }
 
-    cv::Mat debug_bgr, gray;
-    const bool need_debug_image = save_debug_images_;
-    try {
-      const auto & enc = msg->encoding;
-      if (enc == sensor_msgs::image_encodings::MONO8) {
-        gray = cv_ptr->image;
-        if (need_debug_image) cv::cvtColor(cv_ptr->image, debug_bgr, cv::COLOR_GRAY2BGR);
-      } else if (enc == sensor_msgs::image_encodings::BGR8) {
-        cv::cvtColor(cv_ptr->image, gray, cv::COLOR_BGR2GRAY);
-        if (need_debug_image) debug_bgr = cv_ptr->image.clone();
-      } else if (enc == sensor_msgs::image_encodings::RGB8) {
-        cv::cvtColor(cv_ptr->image, gray, cv::COLOR_RGB2GRAY);
-        if (need_debug_image) cv::cvtColor(cv_ptr->image, debug_bgr, cv::COLOR_RGB2BGR);
-      } else if (enc == sensor_msgs::image_encodings::BGRA8) {
-        cv::cvtColor(cv_ptr->image, gray, cv::COLOR_BGRA2GRAY);
-        if (need_debug_image) cv::cvtColor(cv_ptr->image, debug_bgr, cv::COLOR_BGRA2BGR);
-      } else if (enc == sensor_msgs::image_encodings::RGBA8) {
-        cv::cvtColor(cv_ptr->image, gray, cv::COLOR_RGBA2GRAY);
-        if (need_debug_image) cv::cvtColor(cv_ptr->image, debug_bgr, cv::COLOR_RGBA2BGR);
+    // Debug images need BGR for colored marker overlays; GRAY→BGR is cheap
+    // (channel broadcast only, no color math).
+    cv::Mat debug_bgr;
+    if (save_debug_images_) {
+      if (input_frame.channels() == 1) {
+        cv::cvtColor(input_frame, debug_bgr, cv::COLOR_GRAY2BGR);
       } else {
-        auto bgr_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-        cv::cvtColor(bgr_ptr->image, gray, cv::COLOR_BGR2GRAY);
-        if (need_debug_image) debug_bgr = bgr_ptr->image.clone();
+        debug_bgr = input_frame.clone();
       }
-    } catch (const cv_bridge::Exception & e) {
-      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "Image conversion failed for %s: %s", topic_name.c_str(), e.what());
-      return;
     }
 
     DetectionSelection sel;
@@ -1338,7 +1420,7 @@ private:
       selectBestDetection(gray, sel);
     } catch (const std::exception & e) {
       RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "Aruco Nano detection failed for %s: %s", topic_name.c_str(), e.what());
+        "Aruco Nano detection failed for %s: %s", camera_name.c_str(), e.what());
       return;
     }
 
@@ -1347,15 +1429,14 @@ private:
 
     if (ids.empty()) {
       std::string debug_output_path;
-      if (shouldSaveDebugImage(msg, camera, false, debug_output_path)) {
-        saveDebugImage(debug_bgr, debug_output_path, topic_name, sel.candidate_name,
+      if (shouldSaveDebugImage(stamp_sec, camera, false, debug_output_path)) {
+        saveDebugImage(debug_bgr, debug_output_path, camera_name, sel.candidate_name,
                        {}, {}, {}, {}, {}, camera);
       }
       return;
     }
-    // No second cornerSubPix here: aruco_nano refines internally on raw gray.
 
-    const double img_t = timeMsgToSec(msg->header.stamp);
+    const double img_t = stamp_sec;
     InterpolatedOdom odom = interpolateOdomAt(img_t);
 
     cv::Matx44d T_world_body = cv::Matx44d::eye();
@@ -1381,6 +1462,8 @@ private:
     tvecs.reserve(ids.size());
     filtered_flags.reserve(ids.size());
 
+    const builtin_interfaces::msg::Time stamp_msg = secToTimeMsg(stamp_sec);
+
     for (size_t i = 0; i < ids.size(); ++i) {
       const auto label_it = marker_labels_.find(ids[i]);
       if (label_it == marker_labels_.end()) continue;
@@ -1395,7 +1478,7 @@ private:
           track_it->second.kf.statePost.at<double>(1, 0),
           track_it->second.kf.statePost.at<double>(2, 0));
         prior_cam = applyTransform(T_camera_world, p_world);
-        have_prior = (prior_cam[2] > 0.0);  // only useful if in front of camera
+        have_prior = (prior_cam[2] > 0.0);
       }
 
       cv::Vec3d rvec, tvec;
@@ -1406,13 +1489,8 @@ private:
         continue;
       }
 
-      // Marker position in the drone frame for publishing.
-      // p_drone = T_drone_camera * (R_cm * 0 + tvec) = T_drone_camera * tvec.
-      // We could equivalently compose T_drone_marker_raw and pick the
-      // translation, but applying the transform directly to tvec is clearer
-      // and avoids constructing a full marker-frame transform we never need.
       const cv::Vec3d p_drone_marker_raw = applyTransform(camera.T_drone_camera, tvec);
-      auto raw_pose_msg = positionToPoseStamped(p_drone_marker_raw, msg->header.stamp);
+      auto raw_pose_msg = positionToPoseStamped(p_drone_marker_raw, stamp_msg);
       if (publish_raw_pose_) raw_pose_pub_->publish(raw_pose_msg);
 
       geometry_msgs::msg::PoseStamped out_pose_msg = raw_pose_msg;
@@ -1420,8 +1498,6 @@ private:
       bool used_filtered_measurement = false;
 
       if (use_track_filter_ && odom.valid) {
-        // Marker position in world coords: lift drone-frame position into
-        // world using the (interpolated) body pose at the image timestamp.
         const cv::Vec3d p_world_marker_meas = applyTransform(T_world_body, p_drone_marker_raw);
 
         auto & track = tracks_[ids[i]];
@@ -1442,13 +1518,13 @@ private:
           track.kf.statePost.at<double>(2, 0));
         const cv::Vec3d p_drone_marker_filt = applyTransform(T_body_world, p_world_marker_filt);
 
-        out_pose_msg = positionToPoseStamped(p_drone_marker_filt, msg->header.stamp);
+        out_pose_msg = positionToPoseStamped(p_drone_marker_filt, stamp_msg);
         output_kind = "filtered_measurement";
         used_filtered_measurement = true;
       }
 
       registerMeasurementCandidate(ids[i], label_it->second, out_pose_msg,
-                                   topic_name, output_kind, reprojection_error_px);
+                                   camera_name, output_kind, reprojection_error_px);
 
       valid_corners.push_back(corners[i]);
       valid_ids.push_back(ids[i]);
@@ -1458,8 +1534,8 @@ private:
     }
 
     std::string debug_output_path;
-    if (shouldSaveDebugImage(msg, camera, !valid_ids.empty(), debug_output_path)) {
-      saveDebugImage(debug_bgr, debug_output_path, topic_name, sel.candidate_name,
+    if (shouldSaveDebugImage(stamp_sec, camera, !valid_ids.empty(), debug_output_path)) {
+      saveDebugImage(debug_bgr, debug_output_path, camera_name, sel.candidate_name,
                      valid_corners, valid_ids, rvecs, tvecs, filtered_flags, camera);
     }
   }
@@ -1468,7 +1544,7 @@ private:
 
   void saveDebugImage(
     const cv::Mat & debug_bgr, const std::string & output_path,
-    const std::string & topic_name, const std::string & preprocessing_variant_name,
+    const std::string & camera_name, const std::string & preprocessing_variant_name,
     const std::vector<std::vector<cv::Point2f>> & valid_corners,
     const std::vector<int> & valid_ids,
     const std::vector<cv::Vec3d> & rvecs, const std::vector<cv::Vec3d> & tvecs,
@@ -1479,8 +1555,6 @@ private:
     if (!valid_ids.empty()) {
       cv::aruco::drawDetectedMarkers(annotated, valid_corners, valid_ids);
       for (size_t i = 0; i < valid_ids.size() && i < rvecs.size() && i < tvecs.size(); ++i) {
-        // Draw frame axes for visual debugging only (orientation is NOT
-        // published; this is just for sanity-checking pose recovery).
         cv::drawFrameAxes(
           annotated, camera.calibration.camera_matrix, camera.calibration.dist_coeffs,
           rvecs[i], tvecs[i], static_cast<float>(0.5 * marker_length_));
@@ -1502,7 +1576,7 @@ private:
       }
     }
     std::ostringstream header;
-    header << "Aruco Nano | Topic: " << topic_name
+    header << "Aruco Nano | Camera: " << camera_name
            << " | Valid markers: " << valid_ids.size()
            << " | Frame: " << drone_frame_id_
            << " | Prep: " << preprocessing_variant_name;
