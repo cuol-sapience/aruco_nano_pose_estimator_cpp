@@ -149,6 +149,11 @@ public:
     preprocess_use_otsu_threshold_ =
       this->declare_parameter<bool>("preprocess_use_otsu_threshold", false);
 
+    // Camera mount angles: degrees below the horizon (positive = pitched down).
+    // front default = 35° (matches original hardcoded matrix); down default = 90°.
+    camera_front_pitch_deg_ = this->declare_parameter<double>("camera_front_pitch_deg", 20.0);
+    camera_down_pitch_deg_  = this->declare_parameter<double>("camera_down_pitch_deg",  90.0);
+
     // GStreamer pipeline strings. nvvidconv (Jetson VIC hardware block) converts
     // NV12→GRAY8 at zero CPU cost. The output stays in NVMM (Jetson unified
     // memory) so no DMA copy to system RAM occurs; the capture thread maps the
@@ -223,11 +228,7 @@ public:
 
     addCamera(
       "front", camera_front_pipeline_,
-      cv::Matx44d(
-         0.0, -0.57357644,  0.81915204,  0.0,
-         1.0,  0.0,         0.0,         0.0,
-         0.0,  0.81915204,  0.57357644,  0.0,
-         0.0,   0.0,        0.0,        1.0),
+      makeCameraTransform(camera_front_pitch_deg_),
       (cv::Mat_<double>(3, 3) <<
         1134.3171058472644, 0.0, 945.03097055585,
         0.0, 1134.9884203778502, 607.0921091018031,
@@ -239,11 +240,7 @@ public:
     if (!camera_down_pipeline_.empty()) {
       addCamera(
         "down", camera_down_pipeline_,
-        cv::Matx44d(
-           0.0, -1.0, 0.0, 0.0,
-           1.0,  0.0, 0.0, 0.0,
-           0.0,  0.0, 1.0, 0.0,
-           0.0,  0.0, 0.0, 1.0),
+        makeCameraTransform(camera_down_pitch_deg_),
         (cv::Mat_<double>(3, 3) <<
           1134.3171058472644, 0.0, 945.03097055585,
           0.0, 1134.9884203778502, 607.0921091018031,
@@ -447,11 +444,28 @@ private:
 
   std::string camera_front_pipeline_;   // must output GRAY8 (preferred) or BGR
   std::string camera_down_pipeline_;    // empty = disabled
+  double camera_front_pitch_deg_{35.0}; // degrees below horizon, positive = tilted down
+  double camera_down_pitch_deg_{90.0};
 
   cv::Ptr<cv::CLAHE> clahe_;
   cv::Mat gamma_lut_;
 
   // ---- Static utilities ----------------------------------------------------
+
+  // Builds T_drone_camera for a forward-facing camera whose optical axis is
+  // pitched `pitch_deg` degrees below the horizon (positive = tilted down).
+  // Camera axes: X=right, Y=down, Z=optical. Drone axes: FRD (X=fwd, Y=right, Z=down).
+  static cv::Matx44d makeCameraTransform(double pitch_deg)
+  {
+    const double theta = pitch_deg * M_PI / 180.0;
+    const double s = std::sin(theta);
+    const double c = std::cos(theta);
+    return cv::Matx44d(
+       0.0, -s,  c,  0.0,
+       1.0,  0.0, 0.0, 0.0,
+       0.0,  c,   s,  0.0,
+       0.0,  0.0, 0.0, 1.0);
+  }
 
   static int dictionaryNameToEnum(const std::string & name)
   {
@@ -645,6 +659,10 @@ private:
       throw std::runtime_error("kf_depth_to_lateral_ratio_min must be >= 1");
     if (aruco_error_correction_rate_ < 0.0 || aruco_error_correction_rate_ > 1.0)
       throw std::runtime_error("aruco_error_correction_rate must be in [0, 1]");
+    if (camera_front_pitch_deg_ < -90.0 || camera_front_pitch_deg_ > 90.0)
+      throw std::runtime_error("camera_front_pitch_deg must be in [-90, 90]");
+    if (camera_down_pitch_deg_ < -90.0 || camera_down_pitch_deg_ > 90.0)
+      throw std::runtime_error("camera_down_pitch_deg must be in [-90, 90]");
     if (preprocess_gamma_ <= 0.0) throw std::runtime_error("preprocess_gamma must be > 0");
     if (preprocess_clahe_clip_limit_ <= 0.0)
       throw std::runtime_error("preprocess_clahe_clip_limit must be > 0");
