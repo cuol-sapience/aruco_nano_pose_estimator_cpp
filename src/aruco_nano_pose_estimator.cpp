@@ -55,7 +55,7 @@
 // GStreamer + Jetson NVMM (direct buffer access, avoids DMA copy to system RAM)
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
-#include <nvbufsurface.h>
+// #include <nvbufsurface.h>
 
 #include "aruco_nano_pose_estimator_cpp/aruco_nano.h"
 
@@ -84,6 +84,7 @@ public:
   : Node("aruco_nano_pose_estimator")
   {
     // ---- ROS parameters --------------------------------------------------
+    opencv_num_threads_ = this->declare_parameter<int>("opencv_num_threads", 1);
     marker_length_ = this->declare_parameter<double>("marker_length", 1.0);
     drone_frame_id_ = this->declare_parameter<std::string>("drone_frame_id", "drone_frd");
     processing_period_ms_ = this->declare_parameter<int>("processing_period_ms", 33);
@@ -162,20 +163,21 @@ public:
     // element "appsink0".
     camera_front_pipeline_ = this->declare_parameter<std::string>(
       "camera_front_pipeline",
-      "nvarguscamerasrc sensor-id=0 ispdigitalgainrange=\"1 8\" aelock=true"
+      "nvarguscamerasrc sensor-id=0 ispdigitalgainrange=\"1 8\" gainrange=\"3 10\" exposuretimerange=\"40000 8333000\""
       " ! video/x-raw(memory:NVMM),width=1920,height=1200,framerate=12/1,format=NV12"
       " ! nvvidconv"
-      " ! video/x-raw(memory:NVMM),format=GRAY8"
+      " ! video/x-raw,format=GRAY8"
       " ! appsink name=appsink0 drop=true max-buffers=1 sync=false");
     camera_down_pipeline_ = this->declare_parameter<std::string>(
       "camera_down_pipeline",
-      "nvarguscamerasrc sensor-id=1 ispdigitalgainrange=\"1 8\" aelock=true"
+      "nvarguscamerasrc sensor-id=1 ispdigitalgainrange=\"1 8\" gainrange=\"3 10\" exposuretimerange=\"40000 8333000\""
       " ! video/x-raw(memory:NVMM),width=1920,height=1200,framerate=12/1,format=NV12"
       " ! nvvidconv"
-      " ! video/x-raw(memory:NVMM),format=GRAY8"
+      " ! video/x-raw,format=GRAY8"
       " ! appsink name=appsink0 drop=true max-buffers=1 sync=false");
 
     validateParameters();
+    cv::setNumThreads(opencv_num_threads_);
 
     if (save_debug_images_) {
       try {
@@ -219,9 +221,11 @@ public:
     msg_pub_  = this->create_publisher<std_msgs::msg::String>(
       "/aruco/message", rclcpp::QoS(10));
 
+    rclcpp::QoS odom_qos = rclcpp::SensorDataQoS().keep_last(1);
+
     slam_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
       slam_odom_topic_,
-      rclcpp::QoS(50),
+      odom_qos,
       std::bind(&ArucoNanoPoseEstimator::slamOdomCallback, this, std::placeholders::_1));
 
     gst_init(nullptr, nullptr);
@@ -237,18 +241,18 @@ public:
         0.02717223068021268, -0.060021841339080874, 0.0007009591920443065,
         -4.569105989855734e-05, 0.020871849677932104));
 
-    if (!camera_down_pipeline_.empty()) {
-      addCamera(
-        "down", camera_down_pipeline_,
-        makeCameraTransform(camera_down_pitch_deg_),
-        (cv::Mat_<double>(3, 3) <<
-          1134.3171058472644, 0.0, 945.03097055585,
-          0.0, 1134.9884203778502, 607.0921091018031,
-          0.0, 0.0, 1.0),
-        (cv::Mat_<double>(1, 5) <<
-          0.02717223068021268, -0.060021841339080874, 0.0007009591920443065,
-          -4.569105989855734e-05, 0.020871849677932104));
-    }
+    // if (!camera_down_pipeline_.empty()) {
+    //   addCamera(
+    //     "down", camera_down_pipeline_,
+    //     makeCameraTransform(camera_down_pitch_deg_),
+    //     (cv::Mat_<double>(3, 3) <<
+    //       1134.3171058472644, 0.0, 945.03097055585,
+    //       0.0, 1134.9884203778502, 607.0921091018031,
+    //       0.0, 0.0, 1.0),
+    //     (cv::Mat_<double>(1, 5) <<
+    //       0.02717223068021268, -0.060021841339080874, 0.0007009591920443065,
+    //       -4.569105989855734e-05, 0.020871849677932104));
+    // }
 
     processing_timer_ = this->create_wall_timer(
       std::chrono::milliseconds(processing_period_ms_),
@@ -257,10 +261,10 @@ public:
     RCLCPP_INFO(
       this->get_logger(),
       "ArucoNanoPoseEstimator (GStreamer direct, position-only) started. "
-      "marker_length=%.6f, dictionary=%s, frame_id=%s, period=%d ms, "
+      "opencv_num_threads=%d, marker_length=%.6f, dictionary=%s, frame_id=%s, period=%d ms, "
       "preprocess_enable=%s, save_debug_images=%s, slam_odom_topic=%s, "
       "use_track_filter=%s, aruco_error_correction_rate=%.2f",
-      marker_length_, dictionary_name_.c_str(), drone_frame_id_.c_str(),
+      opencv_num_threads_, marker_length_, dictionary_name_.c_str(), drone_frame_id_.c_str(),
       processing_period_ms_,
       preprocess_enable_ ? "true" : "false",
       save_debug_images_ ? "true" : "false",
@@ -396,6 +400,7 @@ private:
   mutable std::mutex odom_buffer_mutex_;
   std::deque<SlamOdomSample> odom_buffer_;
 
+  int opencv_num_threads_{1};
   double marker_length_{1.0};
   std::string drone_frame_id_{"drone_frd"};
   int processing_period_ms_{33};
@@ -642,6 +647,7 @@ private:
 
   void validateParameters() const
   {
+    if (opencv_num_threads_ < 0) throw std::runtime_error("opencv_num_threads must be >= 0");
     if (marker_length_ <= 0.0) throw std::runtime_error("marker_length must be > 0");
     if (processing_period_ms_ <= 0) throw std::runtime_error("processing_period_ms must be > 0");
     if (debug_max_save_rate_hz_ < 0.0)
@@ -758,23 +764,6 @@ private:
           const bool is_nvmm =
             features && gst_caps_features_contains(features, "memory:NVMM");
 
-          if (is_nvmm) {
-            // Map the NVMM buffer into CPU address space via NvBufSurface.
-            // This is a cache-coherent mapping with no DMA copy to system RAM.
-            GstMapInfo map = GST_MAP_INFO_INIT;
-            if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-              NvBufSurface * surf = reinterpret_cast<NvBufSurface *>(map.data);
-              if (NvBufSurfaceMap(surf, 0, 0, NVBUF_MAP_READ) == 0) {
-                // pitch[0] is bytes-per-row for plane 0 (Y/GRAY8 = only plane)
-                const size_t pitch = surf->surfaceList[0].pitch;
-                void * y_ptr = surf->surfaceList[0].mappedAddr.addr[0];
-                const cv::Mat tmp(height, width, CV_8UC1, y_ptr, pitch);
-                frame = tmp.clone();  // one clone to own data before unmap
-                NvBufSurfaceUnMap(surf, 0, 0);
-              }
-              gst_buffer_unmap(buffer, &map);
-            }
-          } else {
             // Non-NVMM fallback (e.g. custom pipeline outputting to system RAM)
             GstMapInfo map = GST_MAP_INFO_INIT;
             if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
@@ -784,7 +773,6 @@ private:
               frame = tmp.clone();
               gst_buffer_unmap(buffer, &map);
             }
-          }
 
           if (!frame.empty()) {
             const double stamp_sec = this->now().seconds();
