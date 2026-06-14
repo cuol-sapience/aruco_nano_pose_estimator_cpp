@@ -55,7 +55,7 @@
 // GStreamer + Jetson NVMM (direct buffer access, avoids DMA copy to system RAM)
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
-#include <nvbufsurface.h>
+// #include <nvbufsurface.h>
 
 #include "aruco_nano_pose_estimator_cpp/aruco_nano.h"
 
@@ -162,17 +162,17 @@ public:
     // element "appsink0".
     camera_front_pipeline_ = this->declare_parameter<std::string>(
       "camera_front_pipeline",
-      "nvarguscamerasrc sensor-id=0 ispdigitalgainrange=\"1 8\" aelock=true"
+      "nvarguscamerasrc sensor-id=0 ispdigitalgainrange=\"1 8\" gainrange=\"3 10\" exposuretimerange=\"40000 8333000\""
       " ! video/x-raw(memory:NVMM),width=1920,height=1200,framerate=12/1,format=NV12"
       " ! nvvidconv"
-      " ! video/x-raw(memory:NVMM),format=GRAY8"
+      " ! video/x-raw,format=GRAY8"
       " ! appsink name=appsink0 drop=true max-buffers=1 sync=false");
     camera_down_pipeline_ = this->declare_parameter<std::string>(
       "camera_down_pipeline",
-      "nvarguscamerasrc sensor-id=1 ispdigitalgainrange=\"1 8\" aelock=true"
+      "nvarguscamerasrc sensor-id=1 ispdigitalgainrange=\"1 8\" gainrange=\"3 10\" exposuretimerange=\"40000 8333000\""
       " ! video/x-raw(memory:NVMM),width=1920,height=1200,framerate=12/1,format=NV12"
       " ! nvvidconv"
-      " ! video/x-raw(memory:NVMM),format=GRAY8"
+      " ! video/x-raw,format=GRAY8"
       " ! appsink name=appsink0 drop=true max-buffers=1 sync=false");
 
     validateParameters();
@@ -758,23 +758,6 @@ private:
           const bool is_nvmm =
             features && gst_caps_features_contains(features, "memory:NVMM");
 
-          if (is_nvmm) {
-            // Map the NVMM buffer into CPU address space via NvBufSurface.
-            // This is a cache-coherent mapping with no DMA copy to system RAM.
-            GstMapInfo map = GST_MAP_INFO_INIT;
-            if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-              NvBufSurface * surf = reinterpret_cast<NvBufSurface *>(map.data);
-              if (NvBufSurfaceMap(surf, 0, 0, NVBUF_MAP_READ) == 0) {
-                // pitch[0] is bytes-per-row for plane 0 (Y/GRAY8 = only plane)
-                const size_t pitch = surf->surfaceList[0].pitch;
-                void * y_ptr = surf->surfaceList[0].mappedAddr.addr[0];
-                const cv::Mat tmp(height, width, CV_8UC1, y_ptr, pitch);
-                frame = tmp.clone();  // one clone to own data before unmap
-                NvBufSurfaceUnMap(surf, 0, 0);
-              }
-              gst_buffer_unmap(buffer, &map);
-            }
-          } else {
             // Non-NVMM fallback (e.g. custom pipeline outputting to system RAM)
             GstMapInfo map = GST_MAP_INFO_INIT;
             if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
@@ -784,7 +767,6 @@ private:
               frame = tmp.clone();
               gst_buffer_unmap(buffer, &map);
             }
-          }
 
           if (!frame.empty()) {
             const double stamp_sec = this->now().seconds();
