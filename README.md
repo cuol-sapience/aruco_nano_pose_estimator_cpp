@@ -1,5 +1,13 @@
 # aruco_nano_pose_estimator_cpp
 
+> [!IMPORTANT]
+> **Active Codebase Notice**: This standalone ROS 2 node is **deprecated/inactive** and is not run separately in the production flight stack.
+> The core ArUco Nano pose estimation logic has been **fully integrated inline** into the [yolo-inference-jetson](file:///C:/Users/liamc/.gemini/antigravity/scratch/yolo-inference-jetson) package (see [aruco_nano_pose.hpp](file:///C:/Users/liamc/.gemini/antigravity/scratch/yolo-inference-jetson/src/aruco_nano_pose.hpp) and [aruco_nano.h](file:///C:/Users/liamc/.gemini/antigravity/scratch/yolo-inference-jetson/src/aruco_nano.h)).
+> 
+> During flight, the Jetson YOLO node captures camera frames, runs coarse detections, and then directly executes this integrated `ArucoNanoPose` class on the same frames to publish precision landing coordinates on `/drone/aruco_nano_detect/pose`. 
+> 
+> Refer to the `yolo-inference-jetson` repository for all active code updates.
+
 ROS 2 Humble C++ node for ArUco marker detection and pose estimation using **Aruco Nano**.
 
 
